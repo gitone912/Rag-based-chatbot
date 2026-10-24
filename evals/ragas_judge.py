@@ -28,7 +28,6 @@ def score_rows(rows: list[dict]) -> list[dict]:
         return []
     _prepare_ragas_imports()
     from openai import AsyncOpenAI
-    from ragas.llms import llm_factory
     from ragas.metrics.collections import (
         AnswerCorrectness,
         ContextPrecision,
@@ -36,6 +35,7 @@ def score_rows(rows: list[dict]) -> list[dict]:
         Faithfulness,
     )
     from app.config import settings
+    from evals.groq_ragas_llm import GroqRagasLLM
 
     api_key = os.getenv("JUDGE_GROQ") or settings.GROQ_API_KEY
     if not api_key:
@@ -46,7 +46,7 @@ def score_rows(rows: list[dict]) -> list[dict]:
         timeout=45.0,
         max_retries=2,
     )
-    llm = llm_factory("openai/gpt-oss-120b", provider="openai", client=client)
+    llm = GroqRagasLLM(client, "openai/gpt-oss-120b")
     metrics = {
         "faithfulness": Faithfulness(llm=llm),
         "answer_correctness": AnswerCorrectness(llm=llm, weights=[1.0, 0.0]),

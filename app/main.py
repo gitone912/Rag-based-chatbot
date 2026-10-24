@@ -6,6 +6,8 @@ import logfire
 import os
 import hmac
 import logging
+import math
+import re
 import uuid
 from dotenv import load_dotenv
 
@@ -68,6 +70,30 @@ def _safe_error_category(error: Exception) -> str:
     if any(isinstance(status, int) and 500 <= status <= 599 for status in statuses):
         return "upstream_server_error"
     return "upstream_failure"
+
+
+def _retry_after_seconds(error: Exception) -> int | None:
+    """Preserve provider retry guidance without returning provider error details."""
+    current = error
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers:
+            value = headers.get("retry-after")
+            if value:
+                try:
+                    return max(1, math.ceil(float(value)))
+                except (TypeError, ValueError):
+                    pass
+        match = re.search(r"try again in (?:(\d+)m)?\s*(\d+(?:\.\d+)?)s", str(current), re.I)
+        if match:
+            minutes = int(match.group(1) or 0)
+            seconds = float(match.group(2))
+            return max(1, math.ceil(minutes * 60 + seconds))
+        current = current.__cause__ or current.__context__
+    return None
 
 
 @app.on_event("startup")
@@ -180,7 +206,13 @@ def query(request: QueryRequest, authorization: Optional[str] = Header(default=N
             cause = cause.__cause__
             deepest_type = type(cause).__name__
         logfire.error(f"Backend request failed | category={category} | type={deepest_type} | ref={reference}")
+        headers = {}
+        if category == "provider_rate_limit":
+            retry_after = _retry_after_seconds(e)
+            if retry_after is not None:
+                headers["Retry-After"] = str(retry_after)
         raise HTTPException(
             status_code=503,
             detail={"code": category, "type": deepest_type, "message": "The RAG service could not complete the request.", "reference": reference},
+            headers=headers,
         ) from e

@@ -18,6 +18,14 @@ API_URL = f"{API_BASE_URL}/query"
 RESPONSE_TRUNCATE = 300
 DELAY_BETWEEN_CALLS = 10   # seconds — stays within Groq RPM on the main key
 REQUEST_TIMEOUT = 120      # seconds — guardrails + LangGraph + Groq can take >60s
+MAX_QUERY_ATTEMPTS = 2
+RETRYABLE_ERROR_CODES = {
+    "provider_rate_limit",
+    "provider_server_error",
+    "provider_timeout",
+    "provider_connection_error",
+    "dependency_unavailable",
+}
 
 
 
@@ -62,12 +70,49 @@ def run_pipeline(golden_dataset: dict, progress_callback=None) -> dict:
                 domain=sample.get("domain", ""),
             ):
                 try:
-                    resp = requests.post(
-                        API_URL,
-                        json={"q": question, "thread_id": f"eval_run_{i}"},
-                        timeout=REQUEST_TIMEOUT,
-                    )
-                    resp.raise_for_status()
+                    for attempt in range(MAX_QUERY_ATTEMPTS):
+                        try:
+                            resp = requests.post(
+                                API_URL,
+                                json={"q": question, "thread_id": f"eval_run_{i}"},
+                                timeout=REQUEST_TIMEOUT,
+                            )
+                        except requests.exceptions.RequestException:
+                            if attempt + 1 >= MAX_QUERY_ATTEMPTS:
+                                raise
+                            delay = 5 * (2 ** attempt)
+                            logfire.warn(
+                                "Retrying evaluation query after transport error",
+                                attempt=attempt + 1,
+                                delay_seconds=delay,
+                            )
+                            time.sleep(delay)
+                            continue
+                        if resp.ok:
+                            break
+
+                        try:
+                            detail = resp.json().get("detail", {})
+                        except (ValueError, AttributeError):
+                            detail = {}
+                        code = detail.get("code") if isinstance(detail, dict) else None
+                        if attempt + 1 >= MAX_QUERY_ATTEMPTS or code not in RETRYABLE_ERROR_CODES:
+                            sample["actual_error"] = code or f"http_{resp.status_code}"
+                            resp.raise_for_status()
+
+                        retry_after = resp.headers.get("Retry-After")
+                        try:
+                            delay = min(300, max(1, int(float(retry_after))))
+                        except (TypeError, ValueError):
+                            delay = 30 * (2 ** attempt)
+                        logfire.warn(
+                            "Retrying transient evaluation query",
+                            error_code=code,
+                            attempt=attempt + 1,
+                            delay_seconds=delay,
+                        )
+                        time.sleep(delay)
+
                     data = resp.json()
 
                     raw_answer = data.get("answer") or ""
@@ -77,6 +122,7 @@ def run_pipeline(golden_dataset: dict, progress_callback=None) -> dict:
                     sample["actual_response"] = raw_answer[:RESPONSE_TRUNCATE]
                     sample["actual_contexts"] = sources[:5]
                     sample["actual_tools_called"] = [detect_tool(thought_process)]
+                    sample["actual_error"] = None
 
                     logfire.info(
                         "✅ Response captured",
@@ -90,12 +136,15 @@ def run_pipeline(golden_dataset: dict, progress_callback=None) -> dict:
                     sample["actual_response"] = ""
                     sample["actual_contexts"] = sample.get("relevant_contexts", [])
                     sample["actual_tools_called"] = ["unknown"]
+                    sample["actual_error"] = "backend_connection_error"
 
                 except Exception as e:
                     logfire.error(f"❌ Query failed: {e}")
                     sample["actual_response"] = ""
                     sample["actual_contexts"] = sample.get("relevant_contexts", [])
                     sample["actual_tools_called"] = ["unknown"]
+                    if not sample.get("actual_error"):
+                        sample["actual_error"] = type(e).__name__
 
             if progress_callback:
                 progress_callback(i, n, question, "done", sample["actual_response"])

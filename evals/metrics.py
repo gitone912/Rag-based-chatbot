@@ -31,7 +31,6 @@ def _prepare_ragas_imports():
 
 _prepare_ragas_imports()
 
-from ragas.llms import llm_factory
 from ragas.embeddings import HuggingFaceEmbeddings
 from ragas import SingleTurnSample
 from ragas.metrics.collections import (
@@ -41,6 +40,7 @@ from ragas.metrics.collections import (
     ContextRecall,
     AnswerCorrectness,
 )
+from evals.groq_ragas_llm import GroqRagasLLM
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 JUDGE_MODEL = "openai/gpt-oss-120b"
@@ -65,7 +65,7 @@ def _build_judge():
         timeout=45.0,
         max_retries=2,
     )
-    llm = llm_factory(JUDGE_MODEL, provider="openai", client=client)
+    llm = GroqRagasLLM(client, JUDGE_MODEL)
     embeddings = HuggingFaceEmbeddings(
         model="sentence-transformers/all-MiniLM-L6-v2",
         use_api=False,
