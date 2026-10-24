@@ -89,7 +89,14 @@ if prompt := st.chat_input("Ask about your documentation..."):
                         url = f"{base_url}/query"
                         payload = {"q": prompt, "thread_id": st.session_state.session_id}
                         response = requests.post(url, json=payload, timeout=60)
+                        response.raise_for_status()
                         data = response.json()
+
+                    if not isinstance(data, dict):
+                        raise ValueError("The backend returned an invalid response.")
+                    full_answer = data.get("answer")
+                    if not isinstance(full_answer, str) or not full_answer.strip():
+                        raise ValueError("The backend returned an empty answer.")
 
                     # Show Reasoning Steps from Backend
                     steps = data.get("thought_process", [])
@@ -109,14 +116,28 @@ if prompt := st.chat_input("Ask about your documentation..."):
                                     st.info(source)
                 except Exception as e:
                     logfire.error(f"❌ UI-Backend Connection Failed: {e}")
-                    status.update(label="❌ Connection Failed", state="error")
-                    st.error("Backend Offline.")
+                    status.update(label="❌ Request Failed", state="error")
+                    if isinstance(e, requests.HTTPError) and e.response is not None:
+                        detail = {}
+                        try:
+                            detail = e.response.json().get("detail", {})
+                        except (ValueError, AttributeError):
+                            pass
+                        code = detail.get("code", "backend_error") if isinstance(detail, dict) else "backend_error"
+                        reference = detail.get("reference") if isinstance(detail, dict) else None
+                        message = f"The backend returned HTTP {e.response.status_code} ({code})."
+                        if reference:
+                            message += f" Reference: {reference}."
+                        st.error(message)
+                    elif isinstance(e, ValueError) and str(e) == "The backend returned an empty answer.":
+                        status.update(label="⚠️ Empty Answer", state="error")
+                        st.error(str(e))
+                    else:
+                        st.error("Could not reach the backend or read its response.")
                     st.stop()
 
             # Final Answer Streaming
             answer_placeholder = st.empty()
-            full_answer = data.get("answer", "No response.")
-
             curr_text = ""
             for char in full_answer:
                 curr_text += char
