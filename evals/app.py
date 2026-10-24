@@ -30,7 +30,7 @@ nest_asyncio.apply()
 
 from evals.pipeline import API_URL, run_pipeline, load_golden_dataset
 from evals.guardrails_eval import run_guardrails_eval, compute_guardrails_metrics
-from evals.metrics import JUDGE_MODEL, run_all_metrics
+from evals.metrics import get_judge_model, run_all_metrics
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -306,6 +306,7 @@ with tab2:
 
 with tab3:
     st.subheader("Eval Metrics — RAGAS + Tool Correctness")
+    judge_model = get_judge_model()
 
     if not st.session_state.pipeline_done:
         st.warning("⚠️ Complete Step 2 (Live Pipeline) first to collect responses.")
@@ -317,7 +318,7 @@ with tab3:
             "Total runtime: ~50 min."
         )
         st.info(
-            f"Judge model: `{JUDGE_MODEL}`. Token key: `JUDGE_GROQ` (falls back to `GROQ_API_KEY`). "
+            f"Judge model: `{judge_model}`. Token key: `JUDGE_GROQ` (falls back to `GROQ_API_KEY`). "
             "Each sample is processed individually to reduce rate-limit pressure.",
             icon="ℹ️",
         )
@@ -356,17 +357,17 @@ with tab3:
                     logfire.warning(
                         "RAGAS metrics run failed",
                         error_type=type(exc).__name__,
-                        judge_model=JUDGE_MODEL,
+                        judge_model=judge_model,
                     )
                     if "tokens per day" in error_text or "(tpd)" in error_text:
                         st.error(
-                            f"Groq’s daily token quota for `{JUDGE_MODEL}` is exhausted. "
+                            f"Groq’s daily token quota for `{judge_model}` is exhausted. "
                             "Wait for the quota reset or set `RAGAS_JUDGE_MODEL` to a model "
                             "with available quota, then rerun Step 3."
                         )
                     elif "rate limit" in error_text or "429" in error_text:
                         st.error(
-                            f"Groq rate-limited the `{JUDGE_MODEL}` evaluation. "
+                            f"Groq rate-limited the `{judge_model}` evaluation. "
                             "Wait for the retry window shown by Groq, then rerun Step 3."
                         )
                     else:

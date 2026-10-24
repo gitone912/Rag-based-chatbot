@@ -43,7 +43,15 @@ from ragas.metrics.collections import (
 from evals.groq_ragas_llm import GroqRagasLLM
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-JUDGE_MODEL = os.getenv("RAGAS_JUDGE_MODEL", "openai/gpt-oss-20b")
+DEFAULT_JUDGE_MODEL = "qwen/qwen3.8-27b"
+
+
+def get_judge_model() -> str:
+    """Resolve the judge at run time so environment overrides take effect."""
+    return os.getenv("RAGAS_JUDGE_MODEL", DEFAULT_JUDGE_MODEL).strip() or DEFAULT_JUDGE_MODEL
+
+
+JUDGE_MODEL = get_judge_model()
 COOLDOWN_STANDARD = 62
 COOLDOWN_MINI = 40       # between individual samples — lets sliding TPM window recover (~2,800 tok/sample)
 GENERAL_BATCH_SIZE = 1  # one sample at a time: abatch_score fires calls concurrently per sample,
@@ -65,7 +73,7 @@ def _build_judge():
         timeout=45.0,
         max_retries=2,
     )
-    llm = GroqRagasLLM(client, JUDGE_MODEL)
+    llm = GroqRagasLLM(client, get_judge_model())
     embeddings = HuggingFaceEmbeddings(
         model="sentence-transformers/all-MiniLM-L6-v2",
         use_api=False,
