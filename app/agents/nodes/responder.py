@@ -1,9 +1,60 @@
 import logfire
+import re
 from app.agents.state import AgentState
 from app.gateway import get_langchain_llm, extract_cache_status
+from app.services.retrieval.web_search import search_web_answer
 
 
 llm = get_langchain_llm(feature="responder")
+
+_WEB_FALLBACK_MARKER = "INSUFFICIENT_DOCUMENT_CONTEXT"
+
+
+def _web_fallback(query: str, state: AgentState) -> dict:
+    """Use Groq browser search when indexed documents are insufficient."""
+    indexed_context = "\n\n".join(state.get("documents") or [])
+    answer, web_results = search_web_answer(query, indexed_context=indexed_context)
+    if not answer or not web_results:
+        refusal = (
+            "The indexed documents don’t contain enough information to answer this, "
+            "and web search didn’t return usable sources."
+        )
+        return {
+            "final_answer": refusal,
+            "status": "Document context insufficient; web search unavailable or empty.",
+            "plan": state["plan"] + ["Web fallback: no usable results"],
+            "documents": [],
+            "messages": [{"role": "assistant", "content": refusal}],
+        }
+
+    formatted_sources = []
+    for index, item in enumerate(web_results, start=1):
+        source = (
+            f"WEB SOURCE [{index}]: {item['title']}\n"
+            f"URL: [{item['url']}]({item['url']})"
+        )
+        formatted_sources.append(source)
+    source_list = "\n".join(
+        f"- [{index}] [{item['title']}]({item['url']})"
+        for index, item in enumerate(web_results, start=1)
+    )
+    # Replace Groq's opaque line markers with compact bibliography numbers and
+    # keep one clickable Sources section rather than repeating it twice.
+    answer_body = re.sub(
+        r"[\u3010\u3016]?\s*(\d+)\S{0,3}L\d+-L\d+\S{0,3}",
+        r"[\1]",
+        answer,
+    )
+    answer_body = re.split(r"(?im)^\s*\*{0,2}sources\*{0,2}\s*:?.*$", answer_body)[0].rstrip()
+    content = f"{answer_body}\n\n**Sources**\n{source_list}"
+
+    return {
+        "final_answer": content,
+        "status": "Answered using web search because indexed documents were insufficient.",
+        "plan": state["plan"] + ["Indexed documents insufficient", "Web search fallback used"],
+        "documents": formatted_sources,
+        "messages": [{"role": "assistant", "content": content}],
+    }
 
 
 def generate_node(state: AgentState):
@@ -13,6 +64,10 @@ def generate_node(state: AgentState):
     chunks and conversation history remain part of the generation prompt.
     """
     query = state["current_query"]
+
+    if query != "CONVERSATIONAL" and not state.get("documents"):
+        logfire.info("No relevant indexed docs; using web fallback.")
+        return _web_fallback(query, state)
 
     history_str = ""
     for msg in state["messages"][:-1]:
@@ -26,6 +81,8 @@ def generate_node(state: AgentState):
         prompt = f"""
         You are a friendly and helpful Enterprise AI Assistant.
         Answer the user's latest message using the CONVERSATION HISTORY below.
+        Be concise: answer in 1–3 sentences, with no more than 80 words unless
+        the user explicitly asks for a detailed explanation. Avoid preambles.
 
         CONVERSATION HISTORY:
         {history_str}
@@ -46,8 +103,13 @@ def generate_node(state: AgentState):
                 break
 
         prompt = f"""
-        You are a Senior Technical Architect.
-        Answer the question using the TECHNICAL CONTEXT provided.
+        You are a concise documentation assistant focused on Kubernetes.
+        Answer only with facts supported by the TECHNICAL CONTEXT. Do not use
+        general knowledge or fill gaps. If the context does not contain enough
+        information to answer, return exactly { _WEB_FALLBACK_MARKER } and nothing
+        else so a web search can be tried. Be direct and concise: use at most 4
+        bullets and 120 words unless the user explicitly asks for more detail.
+        Do not repeat the question or add a long preamble.
 
         TECHNICAL CONTEXT:
         {full_context}
@@ -65,6 +127,9 @@ def generate_node(state: AgentState):
             content = getattr(response, "content", None)
             if not isinstance(content, str) or not content.strip():
                 raise RuntimeError("The LLM returned an empty or non-text response.")
+            if query != "CONVERSATIONAL" and content.strip() == _WEB_FALLBACK_MARKER:
+                logfire.info("Responder found document context insufficient; using web fallback.")
+                return _web_fallback(user_msg, state)
             cache_status = extract_cache_status(response)
             is_cache_hit = cache_status == "HIT"
 

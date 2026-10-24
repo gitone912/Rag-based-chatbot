@@ -71,10 +71,13 @@ def planner_node(state: AgentState):
         )
     
     if decision == "CONVERSATIONAL":
+        # Substantive prompts must be grounded in indexed documentation.
+        # Guardrails handle greetings and other fixed dialog replies before
+        # the graph is entered; do not let a planner label become a general QA path.
         return {
-            "current_query": "CONVERSATIONAL",
-            "status": "Handling conversationally (using memory)...",
-            "plan": ["Intent: Conversational/Memory", "Retrieval: Skipped"]
+            "current_query": user_message,
+            "status": "Checking the indexed documentation for a relevant answer.",
+            "plan": ["Intent: Document search", f"Search Term: {user_message}"],
         }
     
     return {

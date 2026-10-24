@@ -21,7 +21,10 @@ class Settings:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
     GROQ_FALLBACK_API_KEY = os.getenv("GROQ_FALLBACK_API_KEY")
-    GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "2048"))
+    GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "512"))
+    RAG_MIN_RELEVANCE_SCORE = float(os.getenv("RAG_MIN_RELEVANCE_SCORE", "0.45"))
+    WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").strip().lower() == "true"
+    WEB_SEARCH_RESULTS = int(os.getenv("WEB_SEARCH_RESULTS", "3"))
 
     # Use direct Groq inference by default while Portkey is being investigated.
     # Set LLM_PROVIDER=portkey to opt back into the existing gateway integration.
