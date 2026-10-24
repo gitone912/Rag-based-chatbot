@@ -30,7 +30,7 @@ nest_asyncio.apply()
 
 from evals.pipeline import API_URL, run_pipeline, load_golden_dataset
 from evals.guardrails_eval import run_guardrails_eval, compute_guardrails_metrics
-from evals.metrics import run_all_metrics
+from evals.metrics import JUDGE_MODEL, run_all_metrics
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -317,8 +317,8 @@ with tab3:
             "Total runtime: ~50 min."
         )
         st.info(
-            "Token key used: `JUDGE_GROQ` (separate from production key). "
-            "Each sample is processed individually (~2,800 tokens/burst) to avoid the 6,000 TPM ceiling.",
+            f"Judge model: `{JUDGE_MODEL}`. Token key: `JUDGE_GROQ` (falls back to `GROQ_API_KEY`). "
+            "Each sample is processed individually to reduce rate-limit pressure.",
             icon="ℹ️",
         )
 
@@ -347,17 +347,41 @@ with tab3:
                 status_slot.info(msg)
 
             with logfire.span("📊 Streamlit — Run Metrics Button"):
-                metric_results = _run_async(
-                    run_all_metrics(st.session_state.enriched_dataset, status_cb=status_cb)
-                )
-                st.session_state.metric_results = metric_results
+                try:
+                    metric_results = _run_async(
+                        run_all_metrics(st.session_state.enriched_dataset, status_cb=status_cb)
+                    )
+                except Exception as exc:
+                    error_text = str(exc).lower()
+                    logfire.warning(
+                        "RAGAS metrics run failed",
+                        error_type=type(exc).__name__,
+                        judge_model=JUDGE_MODEL,
+                    )
+                    if "tokens per day" in error_text or "(tpd)" in error_text:
+                        st.error(
+                            f"Groq’s daily token quota for `{JUDGE_MODEL}` is exhausted. "
+                            "Wait for the quota reset or set `RAGAS_JUDGE_MODEL` to a model "
+                            "with available quota, then rerun Step 3."
+                        )
+                    elif "rate limit" in error_text or "429" in error_text:
+                        st.error(
+                            f"Groq rate-limited the `{JUDGE_MODEL}` evaluation. "
+                            "Wait for the retry window shown by Groq, then rerun Step 3."
+                        )
+                    else:
+                        st.error(
+                            f"RAGAS scoring stopped ({type(exc).__name__}). "
+                            "Check the configured Groq judge key and model, then rerun Step 3."
+                        )
+                else:
+                    st.session_state.metric_results = metric_results
+                    status_slot.success("✅ All 6 experiments complete!")
 
-            status_slot.success("✅ All 6 experiments complete!")
-
-            for key, title in metric_display_names.items():
-                if key in metric_results:
-                    with results_slots[key].container():
-                        _render_metric_table(metric_results[key], key, title)
+                    for key, title in metric_display_names.items():
+                        if key in metric_results:
+                            with results_slots[key].container():
+                                _render_metric_table(metric_results[key], key, title)
 
         elif st.session_state.metric_results:
             st.success("✅ Metrics already computed. Showing results below.")
