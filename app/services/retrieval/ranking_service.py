@@ -1,4 +1,7 @@
 import time
+import math
+import re
+from collections import Counter
 import logfire
 from flashrank import Ranker, RerankRequest
 
@@ -65,3 +68,111 @@ def rerank_documents(query: str, documents: list[str], top_n: int = 5) -> list[s
         logfire.error(f"❌ [Reranker] Semantic Reranking Failed: {e}")
         # Fallback to the original Qdrant order to ensure the user still gets an answer
         return documents[:top_n]
+
+
+_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does",
+    "for", "from", "how", "in", "is", "it", "of", "on", "or", "the", "this",
+    "to", "what", "when", "where", "which", "with",
+}
+
+_QUERY_SYNONYMS = {
+    "status": ("state", "phase"),
+    "statuses": ("states", "phases", "active", "completed", "failed"),
+    # State/status terminology is not interchangeable lexically, but users
+    # often phrase the exact same lookup either way. Include lifecycle values
+    # because terse status questions otherwise rank introductory chunks above
+    # the operational reference passage.
+    "state": ("status", "phase", "active", "completed", "failed"),
+    "states": ("statuses", "phases", "active", "completed", "failed"),
+    "phase": ("state", "status", "active", "completed", "failed"),
+    "phases": ("states", "statuses", "active", "completed", "failed"),
+    "active": ("state", "status", "running"),
+    "completed": ("state", "status", "succeeded", "successful"),
+    "failed": ("state", "status", "failure", "error"),
+    "report": ("show", "list"),
+    "reports": ("shows", "lists"),
+    "start": ("launch", "run", "create"),
+    "starts": ("launches", "runs", "creates"),
+    "install": ("setup", "deploy"),
+    "installed": ("setup", "deployed"),
+}
+
+
+def _tokens(text: str) -> list[str]:
+    return [
+        token for token in re.findall(r"[a-z0-9]+", text.casefold())
+        if token not in _STOP_WORDS and len(token) > 1
+    ]
+
+
+def expand_query_terms(query: str) -> str:
+    """Add conservative lexical variants for common operational vocabulary."""
+    terms = _tokens(query)
+    expanded = list(terms)
+    for term in terms:
+        expanded.extend(_QUERY_SYNONYMS.get(term, ()))
+    return " ".join(dict.fromkeys(expanded))
+
+
+def score_documents_bm25(query: str, documents: list[str]) -> list[tuple[str, float]]:
+    """Return lexical candidates and BM25 scores in descending score order."""
+    if not documents:
+        return []
+
+    query_terms = set(_tokens(query))
+    if not query_terms:
+        return [(document, 0.0) for document in documents]
+
+    tokenized = [_tokens(document) for document in documents]
+    average_length = sum(map(len, tokenized)) / max(len(tokenized), 1)
+    document_frequency = Counter(term for terms in tokenized for term in set(terms))
+    k1, b = 1.5, 0.75
+    scores = []
+    for index, terms in enumerate(tokenized):
+        frequencies = Counter(terms)
+        length_norm = 1 - b + b * len(terms) / max(average_length, 1)
+        score = 0.0
+        for term in query_terms:
+            frequency = frequencies[term]
+            if not frequency:
+                continue
+            df = document_frequency[term]
+            inverse_frequency = math.log1p(
+                (len(documents) - df + 0.5) / (df + 0.5)
+            )
+            score += inverse_frequency * frequency * (k1 + 1) / (
+                frequency + k1 * length_norm
+            )
+        scores.append((score, index))
+
+    scores.sort(key=lambda item: (-item[0], item[1]))
+    return [(documents[index], score) for score, index in scores]
+
+
+def rank_documents_bm25(query: str, documents: list[str]) -> list[str]:
+    """Rank retrieved candidates lexically to recover exact names and commands."""
+    return [document for document, _ in score_documents_bm25(query, documents)]
+
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]], *, top_n: int = 5, rank_constant: int = 10
+) -> list[str]:
+    """Fuse rankings; equal scores follow the first list's stable order."""
+    fused_scores: dict[str, float] = {}
+    first_seen: dict[str, int] = {}
+    seen_counter = 0
+    for ranked in ranked_lists:
+        for rank, document in enumerate(ranked, start=1):
+            if document not in first_seen:
+                first_seen[document] = seen_counter
+                seen_counter += 1
+            fused_scores[document] = fused_scores.get(document, 0.0) + 1.0 / (
+                rank_constant + rank
+            )
+
+    fused = sorted(
+        fused_scores,
+        key=lambda document: (-fused_scores[document], first_seen[document]),
+    )
+    return fused[:top_n]

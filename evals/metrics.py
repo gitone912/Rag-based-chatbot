@@ -1,15 +1,16 @@
 """
 Phase 2 — RAGAS + Tool Correctness metrics.
 Uses JUDGE_GROQ key so production GROQ_API_KEY is never exhausted by eval runs.
-All LLM-based metrics run in batches of 5 with 30s cooldowns between sub-batches
-and 60s cooldowns between experiments — calibrated for Groq's 6,000 TPM on_demand tier.
-Contexts are truncated to 300 chars (2 chunks max) so no single request exceeds the limit.
+All LLM-based metrics run one sample at a time with cooldowns calibrated for
+Groq's on-demand token limits. The Ragas Groq adapter caps JSON completions.
+RAGAS receives up to five cleaned retrieved chunks with a bounded per-chunk budget.
 """
 
 
 import os
 import asyncio
 import importlib
+import re
 import sys
 import types
 import logfire
@@ -53,11 +54,11 @@ def get_judge_model() -> str:
 
 JUDGE_MODEL = get_judge_model()
 COOLDOWN_STANDARD = 62
-COOLDOWN_MINI = 40       # between individual samples — lets sliding TPM window recover (~2,800 tok/sample)
+COOLDOWN_MINI = 40       # between samples to let the provider's rolling token window recover
 GENERAL_BATCH_SIZE = 1  # one sample at a time: abatch_score fires calls concurrently per sample,
                          # so batch>1 stacks multiple samples' async calls inside the same second
-CONTEXT_TRUNCATE = 300  # chars per context chunk — reduces single request from ~7,700 to ~400 tokens
-CONTEXT_LIMIT = 2       # number of context chunks passed to RAGAS per sample
+CONTEXT_TRUNCATE = 600  # preserve enough of each passage to expose its evidence
+CONTEXT_LIMIT = 5       # score the same top-five candidates returned to the user
 
 
 def _build_judge():
@@ -93,10 +94,8 @@ async def _cooldown(seconds: int, label: str, status_cb=None):
 def _prep_samples(golden_dataset: dict) -> list:
     """
     Returns only samples with actual_response populated.
-    Truncates contexts to CONTEXT_TRUNCATE chars and limits to CONTEXT_LIMIT chunks
-    so a single RAGAS LLM call stays well under the 6,000 TPM ceiling.
-    (Live contexts from Qdrant are ~1,500 chars each — without truncation a single
-    Faithfulness request exceeds 7,000 tokens which hard-fails on the on_demand tier.)
+    Cleans source labels, then passes the same top-five passages shown to users.
+    A bounded excerpt from each passage keeps requests within the configured rate budget.
     """
     valid = []
     for s in golden_dataset["rag_samples"]:
@@ -104,9 +103,68 @@ def _prep_samples(golden_dataset: dict) -> list:
         if not response:
             continue
         raw_contexts = s.get("actual_contexts") or s.get("relevant_contexts") or []
-        contexts = [c[:CONTEXT_TRUNCATE] for c in raw_contexts[:CONTEXT_LIMIT]]
+        contexts = []
+        for context in raw_contexts[:CONTEXT_LIMIT]:
+            if not isinstance(context, str):
+                continue
+            # Source metadata helps citation display but is not evidence and wastes
+            # the judge's small context budget.
+            body = context.split("CONTENT:", 1)[-1].strip()
+            contexts.append(body[:CONTEXT_TRUNCATE])
         valid.append({**s, "actual_contexts": contexts})
     return valid
+
+
+_EVIDENCE_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+    "can", "do", "does", "for", "from", "how", "in", "into", "is", "it",
+    "of", "on", "or", "that", "the", "their", "this", "to", "was", "were",
+    "what", "when", "which", "with",
+}
+
+
+def _evidence_tokens(text: str) -> set[str]:
+    return {
+        token for token in re.findall(r"[a-z0-9]+", text.casefold())
+        if len(token) > 1 and token not in _EVIDENCE_STOP_WORDS
+    }
+
+
+def compute_gold_evidence_recall(golden_dataset: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute local token recall against authored evidence excerpts at k=1 and k=5.
+
+    This diagnostic is deterministic and does not call a judge model. It supplements
+    RAGAS because it directly measures whether retrieved text contains the golden
+    evidence, independently of answer generation.
+    """
+    rows_at_1, rows_at_5 = [], []
+    for sample in golden_dataset.get("rag_samples", []):
+        retrieved = [
+            context.split("CONTENT:", 1)[-1]
+            for context in (sample.get("actual_contexts") or [])
+            if isinstance(context, str)
+        ]
+        gold_contexts = sample.get("relevant_contexts") or []
+        per_k: dict[int, list[float]] = {1: [], 5: []}
+        for gold in gold_contexts:
+            gold_tokens = _evidence_tokens(gold)
+            if not gold_tokens:
+                continue
+            for k in (1, 5):
+                retrieved_tokens = set().union(
+                    *(_evidence_tokens(context) for context in retrieved[:k])
+                ) if retrieved[:k] else set()
+                per_k[k].append(len(gold_tokens & retrieved_tokens) / len(gold_tokens))
+
+        def average(k: int) -> float:
+            values = per_k[k]
+            return round(sum(values) / len(values), 3) if values else 0.0
+
+        question = sample.get("question", "")[:65]
+        rows_at_1.append({"question": question, "evidence_recall_at_1": average(1)})
+        rows_at_5.append({"question": question, "evidence_recall_at_5": average(5)})
+
+    return pd.DataFrame(rows_at_1), pd.DataFrame(rows_at_5)
 
 
 def _score_df(metric_key: str, samples: list, scores) -> pd.DataFrame:
@@ -132,7 +190,7 @@ async def _batched_score(metric, inputs: list, samples: list, status_cb=None, la
 
 async def run_all_metrics(golden_dataset: dict, status_cb=None) -> dict:
     """
-    Runs all 6 experiments. Returns dict keyed by metric name → DataFrame.
+    Runs five RAGAS metrics, tool correctness, and two local evidence-recall diagnostics.
     status_cb(message: str) is called for live UI updates.
     """
     judge_llm, ragas_embeddings = _build_judge()
@@ -257,7 +315,16 @@ async def run_all_metrics(golden_dataset: dict, status_cb=None) -> dict:
             results["tool_correctness"] = df
             logfire.info("🧪 Tool Correctness done", avg=round(df["tool_correctness"].mean(), 3))
 
+        evidence_at_1, evidence_at_5 = compute_gold_evidence_recall(golden_dataset)
+        results["evidence_recall_at_1"] = evidence_at_1
+        results["evidence_recall_at_5"] = evidence_at_5
+        logfire.info(
+            "Local evidence recall complete",
+            at_1=round(evidence_at_1["evidence_recall_at_1"].mean(), 3),
+            at_5=round(evidence_at_5["evidence_recall_at_5"].mean(), 3),
+        )
+
         if status_cb:
-            status_cb("✅ All 6 experiments complete!")
+            status_cb("✅ All six experiments and local retrieval diagnostics complete!")
 
     return results

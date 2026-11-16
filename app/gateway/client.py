@@ -1,7 +1,6 @@
 """Central LLM provider selection for the RAG application.
 
-Direct Groq is the default. Portkey is imported and initialized only when the
-explicit ``LLM_PROVIDER=portkey`` path (or the legacy client export) is used.
+Groq is the default; Gemini and Portkey are explicit provider choices.
 """
 from functools import lru_cache
 from typing import Any
@@ -38,8 +37,7 @@ def get_portkey_client():
 def get_langchain_llm(feature: str = "rag"):
     """Return the configured LLM with LangChain's ``invoke`` interface.
 
-    The same provider is shared by the planner and responder so there is one
-    generation path and no implicit fallback from Groq to Portkey.
+    The same provider is shared by planner, guardrails, and responder.
     """
     provider = settings.LLM_PROVIDER
     if provider == "groq":
@@ -48,11 +46,27 @@ def get_langchain_llm(feature: str = "rag"):
         return ChatGroq(
             api_key=settings.GROQ_API_KEY,
             model=settings.GROQ_MODEL,
-            temperature=0.1 if feature == "responder" else 0,
+            temperature=0,
             max_tokens=settings.GROQ_MAX_TOKENS,
             reasoning_effort="low",
             timeout=settings.LLM_TIMEOUT_SECONDS,
-            max_retries=settings.LLM_MAX_RETRIES,
+            # Let daily quota errors reach the API immediately. The evaluation
+            # runner owns retries for short, transient rate limits.
+            max_retries=settings.GROQ_MAX_RETRIES,
+        )
+
+    if provider == "gemini":
+        if not settings.GEMINI_API_KEY:
+            raise RuntimeError("LLM_PROVIDER=gemini requires GEMINI_API_KEY.")
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        return ChatGoogleGenerativeAI(
+            api_key=settings.GEMINI_API_KEY,
+            model=settings.GEMINI_MODEL,
+            temperature=0.1 if feature == "responder" else 0,
+            max_tokens=settings.GROQ_MAX_TOKENS,
+            request_timeout=settings.LLM_TIMEOUT_SECONDS,
+            retries=settings.GEMINI_MAX_RETRIES,
         )
 
     if provider == "portkey":
@@ -80,7 +94,7 @@ def get_langchain_llm(feature: str = "rag"):
         )
 
     raise ValueError(
-        f"Unsupported LLM_PROVIDER {provider!r}; choose 'groq' or 'portkey'."
+        f"Unsupported LLM_PROVIDER {provider!r}; choose 'groq', 'gemini', or 'portkey'."
     )
 
 
@@ -108,6 +122,11 @@ def classify_provider_error(error: Exception) -> str:
 
     joined_names = " ".join(names)
     joined_messages = " ".join(messages)
+    if any(
+        marker in joined_messages
+        for marker in ("tokens per day", "daily token limit", "tpd limit")
+    ):
+        return "provider_daily_quota"
     if 401 in statuses or "authentication" in joined_names or "invalid api key" in joined_messages:
         return "provider_authentication"
     if 403 in statuses or "permission" in joined_names:

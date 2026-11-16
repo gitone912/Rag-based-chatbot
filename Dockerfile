@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY ui ./ui
 COPY evals ./evals
+COPY scripts ./scripts
 RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /srv/app
 USER appuser
 EXPOSE 8000

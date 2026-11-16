@@ -30,7 +30,11 @@ nest_asyncio.apply()
 
 from evals.pipeline import API_URL, run_pipeline, load_golden_dataset
 from evals.guardrails_eval import run_guardrails_eval, compute_guardrails_metrics
-from evals.metrics import get_judge_model, run_all_metrics
+from evals.metrics import (
+    compute_gold_evidence_recall,
+    get_judge_model,
+    run_all_metrics,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -151,7 +155,12 @@ with tab1:
             "Description": g["description"],
         })
     st.dataframe(pd.DataFrame(g_rows), use_container_width=True, hide_index=True)
-    st.caption("6 guardrails test cases: 3 adversarial (should block) + 3 legit (should pass)")
+    expected_blocks = sum(1 for case in golden["guardrails_samples"] if case["expected_blocked"])
+    expected_passes = len(golden["guardrails_samples"]) - expected_blocks
+    st.caption(
+        f"{len(golden['guardrails_samples'])} guardrail cases: "
+        f"{expected_blocks} expected blocks + {expected_passes} expected passes"
+    )
 
     with st.expander("View raw golden_dataset.json"):
         st.json(golden)
@@ -161,7 +170,7 @@ with tab2:
     st.markdown(
         f"Sends each golden question to your **running FastAPI app** (`{API_URL}`). "
         "Captures the actual response, retrieved contexts, and tool called. "
-        "Responses are truncated to 300 chars to save tokens for the RAGAS judging step."
+        "Responses are capped at 2,000 characters to preserve complete concise answers for evaluation."
     )
     st.info(
         "⚠️ Make sure your FastAPI backend is running first: `uvicorn app.main:app --reload --port 8000`",
@@ -219,11 +228,30 @@ with tab2:
                 )
 
         with logfire.span("🚀 Streamlit — Run Pipeline Button"):
-            enriched = run_pipeline(golden, progress_callback=pipeline_cb)
+            checkpoint_path = os.path.join(
+                os.path.dirname(__file__), "e2e_citation_evaluation_results.json"
+            )
+            enriched = run_pipeline(
+                golden,
+                progress_callback=pipeline_cb,
+                checkpoint_path=checkpoint_path,
+            )
             st.session_state.enriched_dataset = enriched
 
-        progress_bar.progress(100, text="✅ All responses collected!")
-        status_slot.success(f"💾 {len(enriched['rag_samples'])} responses stored in session.")
+        pipeline_metrics = enriched.get("pipeline_metrics", {})
+        if pipeline_metrics.get("pending", 0):
+            st.session_state.pipeline_done = False
+            status_slot.warning(
+                "The live run stopped before all questions completed. Results are checkpointed; "
+                "rerun after provider quota is available to resume."
+            )
+            st.stop()
+
+        progress_bar.progress(100, text="✅ Pipeline finished")
+        status_slot.success(
+            f"💾 {pipeline_metrics.get('completed', 0)} / "
+            f"{pipeline_metrics.get('questions', len(enriched['rag_samples']))} responses completed."
+        )
 
         # ── Guardrails tests ──────────────────────────────────────────────────
         st.divider()
@@ -261,11 +289,12 @@ with tab2:
 
         st.dataframe(pd.DataFrame(g_rows_live), use_container_width=True, hide_index=True)
 
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Correct", f"{g_metrics['correct']}/{g_metrics['total']}")
+        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+        mc1.metric("Correct", f"{g_metrics['correct']}/{g_metrics['evaluated']}")
         mc2.metric("Precision", f"{g_metrics['precision']:.2f}")
         mc3.metric("Recall", f"{g_metrics['recall']:.2f}")
         mc4.metric("Accuracy", f"{g_metrics['accuracy']:.2f}")
+        mc5.metric("Errors", f"{g_metrics['errors']}")
 
     elif st.session_state.pipeline_done:
         st.success("✅ Pipeline already run. See results below.")
@@ -279,6 +308,7 @@ with tab2:
                 "Live Response": s["actual_response"][:100] + "..." if len(s.get("actual_response","")) > 100 else s.get("actual_response",""),
                 "Tool Called": s["actual_tools_called"][0] if s.get("actual_tools_called") else "—",
                 "Contexts Retrieved": len(s.get("actual_contexts", [])),
+                "Latency (ms)": s.get("actual_latency_ms"),
             })
         st.dataframe(pd.DataFrame(resp_rows), use_container_width=True, hide_index=True)
 
@@ -298,11 +328,56 @@ with tab2:
                 })
             st.dataframe(pd.DataFrame(g_rows_prev), use_container_width=True, hide_index=True)
             gm = compute_guardrails_metrics(st.session_state.guardrails_results)
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Correct", f"{gm['correct']}/{gm['total']}")
+            mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+            mc1.metric("Correct", f"{gm['correct']}/{gm['evaluated']}")
             mc2.metric("Precision", f"{gm['precision']:.2f}")
             mc3.metric("Recall", f"{gm['recall']:.2f}")
             mc4.metric("Accuracy", f"{gm['accuracy']:.2f}")
+            mc5.metric("Errors", f"{gm['errors']}")
+
+    if st.session_state.enriched_dataset is not None:
+        e2e = st.session_state.enriched_dataset.get("pipeline_metrics", {})
+        st.divider()
+        st.subheader("End-to-end latency")
+        latency_cols = st.columns(5)
+        latency_cols[0].metric("Queries", e2e.get("questions", 0))
+        latency_cols[1].metric("Completed", e2e.get("completed", 0))
+        latency_cols[2].metric("Errors", e2e.get("errors", 0))
+        latency_cols[3].metric(
+            "Median latency",
+            f"{e2e['median_latency_ms']:.0f} ms" if e2e.get("median_latency_ms") is not None else "—",
+        )
+        latency_cols[4].metric(
+            "P95 latency",
+            f"{e2e['p95_latency_ms']:.0f} ms" if e2e.get("p95_latency_ms") is not None else "—",
+        )
+        st.caption(
+            "Citation presence and ID validity are computed from inline answer citations (the web "
+            "Sources footer is excluded). Source mapping checks API metadata against returned "
+            "contexts. These are format/provenance checks, not semantic support judgments."
+        )
+        citation_cols = st.columns(3)
+        citation_cols[0].metric(
+            "Inline citation coverage",
+            f"{e2e['citation_presence_rate']:.0%}"
+            if e2e.get("citation_presence_rate") is not None else "—",
+        )
+        citation_cols[1].metric(
+            "Inline ID validity",
+            f"{e2e['citation_id_validity_rate']:.0%}"
+            if e2e.get("citation_id_validity_rate") is not None else "—",
+        )
+        citation_cols[2].metric(
+            "API source mapping",
+            f"{e2e['citation_metadata_source_match_rate']:.0%}"
+            if e2e.get("citation_metadata_source_match_rate") is not None else "—",
+        )
+        st.download_button(
+            "Download end-to-end run (JSON)",
+            data=json.dumps(st.session_state.enriched_dataset, ensure_ascii=False, indent=2),
+            file_name="rag_e2e_evaluation.json",
+            mime="application/json",
+        )
 
 with tab3:
     st.subheader("Eval Metrics — RAGAS + Tool Correctness")
@@ -311,8 +386,25 @@ with tab3:
     if not st.session_state.pipeline_done:
         st.warning("⚠️ Complete Step 2 (Live Pipeline) first to collect responses.")
     else:
+        evidence_at_1, evidence_at_5 = compute_gold_evidence_recall(
+            st.session_state.enriched_dataset
+        )
+        evidence_col1, evidence_col5 = st.columns(2)
+        evidence_col1.metric(
+            "Gold evidence token coverage @1",
+            f"{evidence_at_1['evidence_recall_at_1'].mean():.2f}",
+        )
+        evidence_col5.metric(
+            "Gold evidence token coverage @5",
+            f"{evidence_at_5['evidence_recall_at_5'].mean():.2f}",
+        )
+        st.caption(
+            "Deterministic local retrieval diagnostic: share of golden evidence tokens "
+            "present in the top 1 or top 5 retrieved passages. This is separate from RAGAS."
+        )
         st.markdown(
-            "Runs all **6 metric experiments** on the stored responses. "
+            "Runs **five RAGAS metrics**, tool correctness, and two local evidence-recall checks. "
+            "The local checks compare retrieved passages with the golden evidence at rank 1 and rank 5. "
             "LLM-based metrics use `JUDGE_GROQ` key — samples are scored one at a time "
             "with 40s cooldowns between samples to stay within Groq's **6,000 TPM** on-demand limit. "
             "Total runtime: ~50 min."
@@ -340,6 +432,8 @@ with tab3:
                 "context_recall":    "Exp 4 — Context Recall",
                 "answer_correctness":"Exp 5 — Answer Correctness",
                 "tool_correctness":  "Exp 6 — Tool Correctness",
+                "evidence_recall_at_1": "Local — Gold Evidence Recall @1",
+                "evidence_recall_at_5": "Local — Gold Evidence Recall @5",
             }
             for key, title in metric_display_names.items():
                 results_slots[key] = st.empty()
@@ -377,7 +471,7 @@ with tab3:
                         )
                 else:
                     st.session_state.metric_results = metric_results
-                    status_slot.success("✅ All 6 experiments complete!")
+                    status_slot.success("✅ RAGAS, tool correctness, and local evidence checks complete!")
 
                     for key, title in metric_display_names.items():
                         if key in metric_results:
@@ -393,6 +487,8 @@ with tab3:
                 "context_recall":    "Exp 4 — Context Recall",
                 "answer_correctness":"Exp 5 — Answer Correctness",
                 "tool_correctness":  "Exp 6 — Tool Correctness",
+                "evidence_recall_at_1": "Local — Gold Evidence Recall @1",
+                "evidence_recall_at_5": "Local — Gold Evidence Recall @5",
             }
             for key, title in metric_display_names.items():
                 if key in st.session_state.metric_results:
@@ -411,16 +507,20 @@ with tab3:
                 ("Context Recall",     mr.get("context_recall",    pd.DataFrame()).get("context_recall",    pd.Series()).mean()),
                 ("Answer Correctness", mr.get("answer_correctness",pd.DataFrame()).get("answer_correctness",pd.Series()).mean()),
                 ("Tool Correctness",   mr.get("tool_correctness",  pd.DataFrame()).get("tool_correctness",  pd.Series()).mean()),
+                ("Gold Evidence Recall @1", mr.get("evidence_recall_at_1", pd.DataFrame()).get("evidence_recall_at_1", pd.Series()).mean()),
+                ("Gold Evidence Recall @5", mr.get("evidence_recall_at_5", pd.DataFrame()).get("evidence_recall_at_5", pd.Series()).mean()),
             ]
 
-            cols = st.columns(len(summary))
-            for col, (name, score) in zip(cols, summary):
-                if pd.notna(score):
-                    col.metric(
-                        label=name,
-                        value=f"{score:.2f}",
-                        delta=_grade(score),
-                    )
+            for start in range(0, len(summary), 4):
+                row = summary[start : start + 4]
+                cols = st.columns(len(row))
+                for col, (name, score) in zip(cols, row):
+                    if pd.notna(score):
+                        col.metric(
+                            label=name,
+                            value=f"{score:.2f}",
+                            delta=_grade(score),
+                        )
 
             if st.session_state.guardrails_results:
                 gm = compute_guardrails_metrics(st.session_state.guardrails_results)

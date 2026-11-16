@@ -18,3 +18,15 @@ PROJECT_STATUS_AND_REQUIREMENTS.md
 test_groq.py
 test_groq_keys.py
 test_portkey.py
+backups/
+output/
+report_render/
+evals/*_results*.json
+evals/full_evaluation_metrics.json
+evals/retrieval_holdout.json
+evals/*taxonomy*.json
+evals/hybrid_retrieval_comparison.json
+evals/guardrail_validation.json
+evals/guardrail_policy_validation.json
+evals/retrieval_benchmark_results*.json
+*.err

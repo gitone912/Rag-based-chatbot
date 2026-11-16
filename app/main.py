@@ -5,13 +5,14 @@
 import logfire
 import os
 import hmac
-import logging
 import math
 import re
 import uuid
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
+os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 logfire_export = os.getenv("LOGFIRE_SEND_TO_LOGFIRE", "false").lower()
 if logfire_export not in {"true", "false", "if-token-present"}:
     logfire_export = "if-token-present"
@@ -25,10 +26,16 @@ logfire_options = {
 logfire.configure(**logfire_options)
 
 # Now safe to import app modules - logfire is already active
-from fastapi import FastAPI, Response, HTTPException, Header
-from app.agents.graph import rag_agent
+from fastapi import FastAPI, Response, HTTPException, Header, Request
+from fastapi.responses import PlainTextResponse
+from app.agents import graph as agent_graph
 from app.gateway.client import classify_provider_error
 from app.guardrails import initialize_rails, guard
+from app.monitoring.metrics import record_http_request, render_metrics
+from app.security.auth import authenticate_request, scoped_thread_id
+from app.services.rate_limit import rate_limiter
+from app.services.memory import open_memory_runtime
+from app.config import settings
 
 from pydantic import BaseModel, StringConstraints
 from typing import Annotated, Optional
@@ -36,6 +43,33 @@ from typing import Annotated, Optional
 
 # Initialize FastAPI
 app = FastAPI(title="Enterprise Agentic RAG API", version="1.0.0")
+
+
+@app.middleware("http")
+async def observe_http_request(request: Request, call_next):
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        record_http_request(
+            request.method,
+            route,
+            status,
+            time.perf_counter() - started,
+        )
+
+
+@app.get("/metrics", response_class=PlainTextResponse, include_in_schema=False)
+def metrics(authorization: Optional[str] = Header(default=None)):
+    if settings.METRICS_BEARER_TOKEN:
+        provided = authorization[7:] if authorization and authorization.lower().startswith("bearer ") else ""
+        if not hmac.compare_digest(provided, settings.METRICS_BEARER_TOKEN):
+            raise HTTPException(status_code=401, detail="Metrics authorization required.")
+    return render_metrics()
 
 
 def _safe_error_category(error: Exception) -> str:
@@ -49,6 +83,10 @@ def _safe_error_category(error: Exception) -> str:
         current = current.__cause__ or current.__context__
     message = " ".join(str(item) for item in chain).lower()
     statuses = {getattr(item, "status_code", None) for item in chain}
+    if any(term in message for term in ("api_key_invalid", "api key not valid", "invalid api key")):
+        return "provider_authentication"
+    if any(term in message for term in ("per day", "daily token quota", "daily quota", "tpd limit")):
+        return "provider_daily_quota"
     if any(any(term in str(getattr(item, "__module__", "")).lower() for term in ("groq", "openai")) for item in chain):
         return classify_provider_error(error)
     if 401 in statuses:
@@ -63,7 +101,7 @@ def _safe_error_category(error: Exception) -> str:
         return "provider_authentication"
     if "429" in message or "rate limit" in message or "quota" in message:
         return "provider_rate_limit"
-    if any(term in message for term in ("qdrant", "collection not found", "vector store")):
+    if any(term in message for term in ("qdrant", "collection not found", "vector store", "vector retrieval")):
         return "vector_store"
     if any(term in message for term in ("timeout", "name resolution", "connection error", "connecterror")):
         return "dependency_unavailable"
@@ -98,13 +136,33 @@ def _retry_after_seconds(error: Exception) -> int | None:
 
 @app.on_event("startup")
 def startup_event():
-    # NeMo logs full prompts and user messages at INFO; keep those private.
-    logging.getLogger("nemoguardrails").setLevel(logging.WARNING)
+    if settings.AUTH_MODE not in {"none", "shared_token", "cognito"}:
+        raise RuntimeError("AUTH_MODE must be none, shared_token, or cognito.")
+    if settings.AUTH_MODE == "shared_token" and not settings.API_AUTH_TOKEN:
+        raise RuntimeError("shared_token mode requires API_AUTH_TOKEN.")
+    if settings.AUTH_MODE == "cognito" and not settings.METRICS_BEARER_TOKEN:
+        raise RuntimeError("Cognito mode requires METRICS_BEARER_TOKEN to protect /metrics.")
+    rate_limiter.initialize()
+    memory_runtime = open_memory_runtime()
+    if memory_runtime is not None:
+        agent_graph.configure_checkpointer(memory_runtime.checkpointer)
+    app.state.memory_runtime = memory_runtime
     initialize_rails()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    memory_runtime = getattr(app.state, "memory_runtime", None)
+    if memory_runtime is not None:
+        memory_runtime.close()
 
 class QueryRequest(BaseModel):
     q: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=8000)]
     thread_id: Annotated[str, StringConstraints(min_length=1, max_length=128)] = "default_user"
+
+
+class MemoryDeleteRequest(BaseModel):
+    thread_id: Annotated[str, StringConstraints(min_length=1, max_length=128)] | None = None
     
     
 @app.get("/")
@@ -126,7 +184,19 @@ def readiness():
         names = {item.name for item in client.get_collections().collections}
         if settings.QDRANT_COLLECTION not in names:
             raise HTTPException(status_code=503, detail="The knowledge collection is not initialized; run ingestion first.")
-        return {"status": "ready", "checks": {"qdrant": "ok", "collection": "ready"}}
+        checks = {"qdrant": "ok", "collection": "ready"}
+        rate_limiter.check_ready()
+        checks["rate_limiter"] = "ok"
+        memory_runtime = getattr(app.state, "memory_runtime", None)
+        if memory_runtime is not None:
+            with memory_runtime.pool.connection() as connection:
+                connection.execute("SELECT 1")
+            checks["memory"] = "postgres"
+        elif settings.AUTH_MODE == "cognito":
+            raise HTTPException(status_code=503, detail="Durable memory is required in Cognito mode.")
+        else:
+            checks["memory"] = "process_local"
+        return {"status": "ready", "checks": checks}
     except HTTPException:
         raise
     except Exception as exc:
@@ -140,7 +210,7 @@ def get_graph_image():
     Returns the Mermaid image of the agent's workflow.
     """
     try:
-        png_bytes = rag_agent.get_graph().draw_mermaid_png()
+        png_bytes = agent_graph.rag_agent.get_graph().draw_mermaid_png()
         return Response(content=png_bytes, media_type="image/png")
     except Exception as e:
         return {"error": f"Could not generate graph image: {e}"}
@@ -154,24 +224,28 @@ def query(request: QueryRequest, authorization: Optional[str] = Header(default=N
     q = request.q
     thread_id = request.thread_id
 
-    # Optional shared bearer token for deployments behind a trusted ingress.
-    # Leave unset for local development; use user/session auth for public apps.
-    expected_token = os.getenv("API_AUTH_TOKEN")
-    if expected_token:
-        provided = authorization[7:] if authorization and authorization.lower().startswith("bearer ") else ""
-        if not hmac.compare_digest(provided, expected_token):
-            raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
+    identity = authenticate_request(authorization)
+    rate_limiter.enforce(identity.subject)
 
     initial_state = {
         "messages": [{"role": "user", "content": q}],
         "current_query": q,
         "documents": [],
+        "citation_ids": [],
         "plan": ["Start"],
         "status": "Initializing Graph..."
     }
     
     # Configuration for Memory (Thread ID)
-    config = {"configurable": {"thread_id": thread_id}}
+    scoped_id = (
+        thread_id
+        if identity.provider == "local"
+        else scoped_thread_id(identity, thread_id)
+    )
+    memory_runtime = getattr(app.state, "memory_runtime", None)
+    if memory_runtime is not None:
+        memory_runtime.retention.touch(identity.subject, scoped_id)
+    config = {"configurable": {"thread_id": scoped_id}}
     
     try:
         # Gate 1: NeMo Guardrails — blocks off-topic, jailbreaks, and handles dialog
@@ -183,19 +257,56 @@ def query(request: QueryRequest, authorization: Optional[str] = Header(default=N
                 "answer": rail_response,
                 "thought_process": ["Intent: Guardrails Fired", "Retrieval: Skipped"],
                 "status": "Blocked by guardrails.",
-                "sources": []
+                "sources": [],
+                "citations": [],
             }
 
         # Gate 2: LangGraph RAG pipeline
         # Run the graph synchronously to preserve Logfire context variables
-        final_output = rag_agent.invoke(initial_state, config=config)
+        final_output = agent_graph.rag_agent.invoke(initial_state, config=config)
         
+        documents = final_output.get("documents", [])
+        citation_ids = final_output.get("citation_ids", [])
+        citations = []
+        for citation_id in citation_ids:
+            if (
+                not isinstance(citation_id, int)
+                or isinstance(citation_id, bool)
+                or not 1 <= citation_id <= len(documents)
+                or not isinstance(documents[citation_id - 1], str)
+            ):
+                continue
+            source_lines = documents[citation_id - 1].splitlines()
+            if source_lines:
+                first_line = source_lines[0]
+                metadata = {"id": citation_id, "source": first_line}
+                if " | source_id=" in first_line:
+                    source_text = first_line.split("SOURCE:", 1)[-1]
+                    parts = [part.strip() for part in source_text.split("|")]
+                    metadata["source"] = parts[0]
+                    for part in parts[1:]:
+                        key, separator, value = part.partition("=")
+                        if separator and key in {
+                            "source_id", "version", "chunk", "ingested_at"
+                        }:
+                            metadata[key] = value
+                    if "chunk" in metadata:
+                        try:
+                            metadata["chunk_index"] = int(metadata.pop("chunk"))
+                        except ValueError:
+                            metadata.pop("chunk", None)
+                    if "version" in metadata:
+                        metadata["source_version"] = metadata.pop("version")
+                    if "ingested_at" in metadata:
+                        metadata["ingested_at"] = metadata["ingested_at"]
+                citations.append(metadata)
         return {
             "question": q,
             "answer": final_output.get("final_answer"),
             "thought_process": final_output.get("plan"),
             "status": final_output.get("status"),
-            "sources": final_output.get("documents", [])
+            "sources": documents,
+            "citations": citations,
         }
     except Exception as e:
         category = _safe_error_category(e)
@@ -211,8 +322,35 @@ def query(request: QueryRequest, authorization: Optional[str] = Header(default=N
             retry_after = _retry_after_seconds(e)
             if retry_after is not None:
                 headers["Retry-After"] = str(retry_after)
+        public_message = (
+            "The configured LLM provider's daily token quota is exhausted."
+            if category == "provider_daily_quota"
+            else "The RAG service could not complete the request."
+        )
         raise HTTPException(
             status_code=503,
-            detail={"code": category, "type": deepest_type, "message": "The RAG service could not complete the request.", "reference": reference},
+            detail={"code": category, "type": deepest_type, "message": public_message, "reference": reference},
             headers=headers,
         ) from e
+
+
+@app.delete("/memory", status_code=200)
+def delete_my_memory(
+    request: MemoryDeleteRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Erase all durable conversation checkpoints owned by the authenticated user."""
+    identity = authenticate_request(authorization)
+    memory_runtime = getattr(app.state, "memory_runtime", None)
+    if memory_runtime is None:
+        if not request.thread_id:
+            raise HTTPException(status_code=400, detail="thread_id is required for local memory deletion.")
+        scoped_id = (
+            request.thread_id
+            if identity.provider == "local"
+            else scoped_thread_id(identity, request.thread_id)
+        )
+        agent_graph.delete_local_thread(scoped_id)
+        return {"status": "deleted", "threads_deleted": 1}
+    deleted = memory_runtime.retention.delete_identity(identity.subject)
+    return {"status": "deleted", "threads_deleted": deleted}

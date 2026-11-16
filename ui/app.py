@@ -54,12 +54,52 @@ with st.sidebar:
     st.markdown("---")
     st.success(f"Logfire: {LOGFIRE_STATUS}")
     st.info(f"Memory ID: {st.session_state.session_id[:8]}")
+    auth_mode = os.getenv("AUTH_MODE", "none").strip().lower()
+    cognito_token = ""
+    if auth_mode == "cognito":
+        try:
+            is_logged_in = st.user.is_logged_in
+        except Exception:
+            st.error("Cognito login is not configured. Add the OIDC settings to .streamlit/secrets.toml.")
+            st.stop()
+        if not is_logged_in:
+            st.button(
+                "Sign in with Cognito",
+                on_click=st.login,
+                args=("cognito",),
+                use_container_width=True,
+            )
+            st.stop()
+        token_expiry = int(st.user.get("exp", 0))
+        if token_expiry <= int(time.time()):
+            st.logout()
+            st.stop()
+        try:
+            cognito_token = st.user.tokens["id"]
+        except Exception:
+            st.error("The Cognito ID token is unavailable; enable expose_tokens = ['id'] in .streamlit/secrets.toml.")
+            st.stop()
+        st.caption(f"Signed in: {st.user.get('email', 'authenticated user')}")
+        st.button("Sign out", on_click=st.logout, use_container_width=True)
 
     if st.button("🗑️ Clear History & Memory", use_container_width=True, type="primary"):
-        logfire.warn(f"🗑️ Memory Wipe Triggered for session: {st.session_state.session_id}")
-        st.session_state.messages = []
-        st.session_state.session_id = str(uuid.uuid4())
-        st.rerun()
+        auth_token = cognito_token if auth_mode == "cognito" else os.getenv("API_AUTH_TOKEN", "")
+        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+        try:
+            response = requests.delete(
+                f"{os.getenv('BACKEND_URL', 'http://localhost:8000').rstrip('/')}/memory",
+                headers=headers,
+                json={"thread_id": st.session_state.session_id},
+                timeout=15,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            st.error("Could not erase server-side conversation memory. Please retry.")
+        else:
+            logfire.warn("Conversation memory deletion requested")
+            st.session_state.messages = []
+            st.session_state.session_id = str(uuid.uuid4())
+            st.rerun()
 
 # --- MAIN CHAT ---
 st.title("🤖 Enterprise Agentic Assistant")
@@ -88,7 +128,9 @@ if prompt := st.chat_input("Ask about your documentation..."):
                         base_url = os.getenv("BACKEND_URL", "http://localhost:8000")
                         url = f"{base_url}/query"
                         payload = {"q": prompt, "thread_id": st.session_state.session_id}
-                        response = requests.post(url, json=payload, timeout=60)
+                        auth_token = cognito_token if auth_mode == "cognito" else os.getenv("API_AUTH_TOKEN", "")
+                        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
+                        response = requests.post(url, json=payload, headers=headers, timeout=60)
                         response.raise_for_status()
                         data = response.json()
 
@@ -108,6 +150,15 @@ if prompt := st.chat_input("Ask about your documentation..."):
                     # --- SHOW SOURCES (NESTED EXPANDABLES) ---
                     sources = data.get("sources", [])
                     if sources:
+                        citation_rows = data.get("citations", [])
+                        if citation_rows:
+                            st.caption(
+                                "Cited evidence: "
+                                + " · ".join(
+                                    row.get("source", f"[{row.get('id')}]")
+                                    for row in citation_rows
+                                )
+                            )
                         with st.expander("📄 View Retrieved Context (Sources)"):
                             for i, source in enumerate(sources):
                                 # Create a preview title for each chunk
@@ -125,7 +176,13 @@ if prompt := st.chat_input("Ask about your documentation..."):
                             pass
                         code = detail.get("code", "backend_error") if isinstance(detail, dict) else "backend_error"
                         reference = detail.get("reference") if isinstance(detail, dict) else None
-                        message = f"The backend returned HTTP {e.response.status_code} ({code})."
+                        if code == "provider_daily_quota":
+                            message = (
+                                "The configured LLM provider's daily token quota is exhausted. Resume the saved evaluation "
+                                "after quota resets or configure a provider with available quota."
+                            )
+                        else:
+                            message = f"The backend returned HTTP {e.response.status_code} ({code})."
                         if reference:
                             message += f" Reference: {reference}."
                         st.error(message)

@@ -1,5 +1,7 @@
 from app.agents.state import AgentState
 from app.gateway import get_langchain_llm
+from app.monitoring.metrics import record_llm_error, record_llm_response
+from app.config import settings
 import logfire
 import re
 
@@ -10,7 +12,9 @@ _DOCUMENT_QUERY_TERMS = (
     "kubernetes", "kubectl", "redis", "databricks", "hpa", "vpa",
     "minikube", "metrics server", "parallelism", "completions",
     "restart policy", "sriov", "intel", "networking", "manifest",
-    "pod", "job", "cli", "rest api",
+    "pod", "job", "cli", "rest api", "kube-scheduler", "nodeport",
+    "configmap", "queue", "worker", "lease", "control plane",
+    "container", "cronjob", "autoscaling", "cpu", "memory",
 )
 
 
@@ -24,17 +28,22 @@ def planner_node(state: AgentState):
     """
     # Get the conversation history (excluding the latest message)
     history = ""
-    for msg in state["messages"][:-1]:
+    prior_messages = state["messages"][:-1]
+    history_message_limit = max(0, settings.RAG_HISTORY_MESSAGES)
+    prior_messages = prior_messages[-history_message_limit:] if history_message_limit else []
+    for msg in prior_messages:
         role = "User" if msg["role"] == "user" else "Assistant"
         history += f"{role}: {msg['content']}\n"
+    history_char_limit = max(0, settings.RAG_MAX_HISTORY_CHARS)
+    history = history[-history_char_limit:] if history_char_limit else ""
     
     user_message = state["messages"][-1]["content"] if state["messages"] else ""
 
     # First-turn questions that clearly target indexed technical content should
     # go directly to retrieval; don't let a stochastic planner label them as
     # conversational and skip the knowledge base.
-    if not history.strip() and _is_document_query(user_message):
-        logfire.info("Planner routed first-turn knowledge query to retrieval")
+    if _is_document_query(user_message):
+        logfire.info("Planner routed an in-scope knowledge query to retrieval")
         return {
             "current_query": user_message,
             "status": "Technical research needed. Searching the knowledge base.",
@@ -59,7 +68,12 @@ def planner_node(state: AgentState):
     """
     
     with logfire.span("🧠 Planner Decision"):
-        response = llm.invoke(prompt)
+        try:
+            response = llm.invoke(prompt)
+        except Exception:
+            record_llm_error("planner", settings.LLM_PROVIDER)
+            raise
+        record_llm_response("planner", settings.LLM_PROVIDER, response)
         content = getattr(response, "content", None)
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("The planner LLM returned an empty or non-text response.")

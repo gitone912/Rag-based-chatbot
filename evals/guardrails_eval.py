@@ -7,10 +7,12 @@ Classifies each result as TP / TN / FP / FN and computes precision + recall.
 
 import time
 import copy
+import os
 import requests
 import logfire
 
-API_URL = "http://localhost:8000/query"
+API_BASE_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+API_URL = f"{API_BASE_URL}/query"
 
 
 def _is_blocked(response_json: dict) -> bool:
@@ -29,6 +31,7 @@ def run_guardrails_eval(guardrails_samples: list, progress_callback=None) -> lis
 
     with logfire.span("🛡️ Eval — Guardrails Tests", total=n):
         for i, sample in enumerate(samples):
+            sample["evaluation_error"] = None
             if progress_callback:
                 progress_callback(i, n, sample["input"])
 
@@ -47,17 +50,21 @@ def run_guardrails_eval(guardrails_samples: list, progress_callback=None) -> lis
                     blocked = _is_blocked(resp.json())
 
                 except requests.exceptions.ConnectionError:
-                    logfire.error("❌ Cannot reach FastAPI — is the app running on :8000?")
+                    logfire.error(f"❌ Cannot reach FastAPI at {API_URL}")
                     blocked = False
+                    sample["evaluation_error"] = "connection_error"
 
                 except Exception as e:
                     logfire.error(f"❌ Guardrails test error: {e}")
                     blocked = False
+                    sample["evaluation_error"] = type(e).__name__
 
                 expected = sample["expected_blocked"]
                 sample["actual_blocked"] = blocked
 
-                if expected and blocked:
+                if sample["evaluation_error"]:
+                    sample["result"] = "ERROR"
+                elif expected and blocked:
                     sample["result"] = "TP"
                 elif expected and not blocked:
                     sample["result"] = "FN"
@@ -79,14 +86,15 @@ def run_guardrails_eval(guardrails_samples: list, progress_callback=None) -> lis
 
 
 def compute_guardrails_metrics(results: list) -> dict:
-    tp = sum(1 for r in results if r["result"] == "TP")
-    tn = sum(1 for r in results if r["result"] == "TN")
-    fp = sum(1 for r in results if r["result"] == "FP")
-    fn = sum(1 for r in results if r["result"] == "FN")
+    scored = [r for r in results if r.get("result") in {"TP", "TN", "FP", "FN"}]
+    tp = sum(1 for r in scored if r["result"] == "TP")
+    tn = sum(1 for r in scored if r["result"] == "TN")
+    fp = sum(1 for r in scored if r["result"] == "FP")
+    fn = sum(1 for r in scored if r["result"] == "FN")
 
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    accuracy  = (tp + tn) / len(results) if results else 0.0
+    accuracy  = (tp + tn) / len(scored) if scored else 0.0
 
     return {
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
@@ -94,5 +102,7 @@ def compute_guardrails_metrics(results: list) -> dict:
         "recall": round(recall, 3),
         "accuracy": round(accuracy, 3),
         "total": len(results),
+        "evaluated": len(scored),
+        "errors": len(results) - len(scored),
         "correct": tp + tn,
     }

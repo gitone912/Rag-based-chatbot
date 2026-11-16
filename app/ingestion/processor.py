@@ -2,6 +2,8 @@ import os
 import sys
 import uuid
 import json
+import hashlib
+from datetime import datetime, timezone
 import logfire
 
 from qdrant_client import QdrantClient
@@ -36,6 +38,7 @@ qdrant_client = QdrantClient(
     timeout=30,
 )
 _indexed_sources: set[str] | None = None
+INGESTION_SCHEMA_VERSION = 2
 
 
 def save_processed_locally(data: dict, source_type: str, filename: str) -> str:
@@ -48,8 +51,8 @@ def save_processed_locally(data: dict, source_type: str, filename: str) -> str:
     return dest
 
 
-def source_is_indexed(filename: str) -> bool:
-    """Return whether this collection already has chunks for the source filename."""
+def source_is_indexed(source_id: str, source_version: str) -> bool:
+    """Return whether this exact immutable source version is already indexed."""
     global _indexed_sources
     if _indexed_sources is None:
         _indexed_sources = set()
@@ -59,25 +62,30 @@ def source_is_indexed(filename: str) -> bool:
                 collection_name=settings.QDRANT_COLLECTION,
                 limit=256,
                 offset=offset,
-                with_payload=["source"],
+                with_payload=["source", "source_id", "source_version"],
                 with_vectors=False,
             )
-            _indexed_sources.update(
-                str(point.payload["source"])
-                for point in points
-                if point.payload and point.payload.get("source")
-            )
+            for point in points:
+                payload = point.payload or {}
+                source_key = str(payload.get("source_id") or payload.get("source") or "")
+                version = str(payload.get("source_version") or "")
+                if source_key and version:
+                    _indexed_sources.add(f"{source_key}\0{version}")
             if offset is None:
                 break
-    return filename in _indexed_sources
+    return f"{source_id}\0{source_version}" in _indexed_sources
 
 
-def process_file(file_path: str, filename: str, source_type: str):
+def process_file(file_path: str, filename: str, source_type: str, source_id: str | None = None):
     """Parse → chunk → save locally → embed → index, skipping existing sources."""
+    source_id = (source_id or f"{source_type}/{filename}").replace("\\", "/")
+    with open(file_path, "rb") as source_stream:
+        content_sha256 = hashlib.sha256(source_stream.read()).hexdigest()
+    source_version = f"sha256:{content_sha256}"
     with logfire.span("Processing File", file=filename, source=source_type):
         try:
-            if source_is_indexed(filename):
-                logfire.info(f"Skipping already indexed source: {filename}")
+            if source_is_indexed(source_id, source_version):
+                logfire.info(f"Skipping unchanged source version: {source_id}")
                 return {"indexed": 0, "skipped": 1, "failed": 0}
 
             # 1. Extract text based on file extension
@@ -93,20 +101,25 @@ def process_file(file_path: str, filename: str, source_type: str):
                 full_text = parse_office(file_path)
             else:
                 logfire.warning(f"Skipping unsupported file type: {filename}")
-                return
+                return {"indexed": 0, "skipped": 1, "failed": 0}
 
             if not full_text or not full_text.strip():
                 logfire.warning(f"No text extracted from {filename} — skipping.")
-                return
+                return {"indexed": 0, "skipped": 1, "failed": 0}
 
             # 2. Chunk text
             chunks = chunk_text(full_text)
             if not chunks:
-                return
+                return {"indexed": 0, "skipped": 1, "failed": 0}
 
             # 3. Save processed metadata locally
             processed_data = {
                 "filename": filename,
+                "source_id": source_id,
+                "source_version": source_version,
+                "content_sha256": content_sha256,
+                "ingested_at": datetime.now(timezone.utc).isoformat(),
+                "ingestion_schema_version": INGESTION_SCHEMA_VERSION,
                 "source_type": source_type,
                 "chunks": chunks,
             }
@@ -118,23 +131,63 @@ def process_file(file_path: str, filename: str, source_type: str):
                 embeddings = embed_texts(chunks)
                 points = [
                     models.PointStruct(
-                        id=str(uuid.uuid4()),
+                        id=str(uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"{source_id}:{source_version}:{chunk_index}",
+                        )),
                         vector=vector,
                         payload={
                             "text": chunk,
                             "source": filename,
+                            "source_id": source_id,
+                            "source_version": source_version,
+                            "content_sha256": content_sha256,
+                            "ingested_at": processed_data["ingested_at"],
+                            "chunk_index": chunk_index,
+                            "ingestion_schema_version": INGESTION_SCHEMA_VERSION,
                             "source_type": source_type,
                         },
                     )
-                    for chunk, vector in zip(chunks, embeddings)
+                    for chunk_index, (chunk, vector) in enumerate(zip(chunks, embeddings))
                 ]
 
                 qdrant_client.upsert(
                     collection_name=settings.QDRANT_COLLECTION,
                     points=points,
                 )
+                # New version is durable before stale chunks are removed, so a
+                # failed re-ingestion never leaves the source unavailable.
+                qdrant_client.delete(
+                    collection_name=settings.QDRANT_COLLECTION,
+                    points_selector=models.FilterSelector(
+                        filter=models.Filter(
+                            must=[models.FieldCondition(
+                                key="source_type",
+                                match=models.MatchValue(value=source_type),
+                            )],
+                            should=[
+                                models.FieldCondition(
+                                    key="source_id",
+                                    match=models.MatchValue(value=source_id),
+                                ),
+                                models.FieldCondition(
+                                    key="source",
+                                    match=models.MatchValue(value=filename),
+                                ),
+                            ],
+                            must_not=[models.FieldCondition(
+                                key="source_version",
+                                match=models.MatchValue(value=source_version),
+                            )],
+                        )
+                    ),
+                )
                 if _indexed_sources is not None:
-                    _indexed_sources.add(filename)
+                    _indexed_sources = {
+                        entry for entry in _indexed_sources
+                        if not entry.startswith(f"{source_id}\0")
+                    }
+                    _indexed_sources.add(f"{source_id}\0{source_version}")
                 logfire.info(f"Indexed {len(points)} points to Qdrant from {filename}.")
             return {"indexed": len(points), "skipped": 0, "failed": 0}
 
@@ -150,7 +203,10 @@ def process_directory(dir_path: str, source_type: str):
         logfire.info(f"Found {len(files)} files in {dir_path}.")
         totals = {"indexed": 0, "skipped": 0, "failed": 0}
         for filename in files:
-            result = process_file(os.path.join(dir_path, filename), filename, source_type)
+            source_id = f"{source_type}/{filename}".replace("\\", "/")
+            result = process_file(
+                os.path.join(dir_path, filename), filename, source_type, source_id
+            )
             for key in totals:
                 totals[key] += result[key]
         return totals

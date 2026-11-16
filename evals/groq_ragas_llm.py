@@ -3,7 +3,7 @@
 import asyncio
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from ragas.llms.base import InstructorBaseRagasLLM
 from ragas.llms.base import track
 from ragas.llms.base import LLMUsageEvent
@@ -53,18 +53,41 @@ class GroqRagasLLM(InstructorBaseRagasLLM):
         self.model = model
 
     async def agenerate(self, prompt: str, response_model: type):
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": response_model.__name__,
-                    "strict": True,
-                    "schema": _groq_compatible_schema(response_model),
+        request = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            # Keep each structured result below the current Groq on-demand
+            # output-token-per-minute ceiling. Ragas responses are short JSON
+            # objects; schema validation rejects any truncated response.
+            "max_completion_tokens": 600,
+        }
+        if self.model == "qwen/qwen3.8-27b":
+            # Reasoning tokens can consume the JSON completion budget without
+            # contributing to the structured Ragas result.
+            request["reasoning_effort"] = "none"
+        try:
+            response = await self.client.chat.completions.create(
+                **request,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_model.__name__,
+                        "strict": True,
+                        "schema": _groq_compatible_schema(response_model),
+                    },
                 },
-            },
-        )
+            )
+        except BadRequestError as error:
+            # Some Groq model responses fail strict schema-constrained decoding
+            # despite a valid request schema. Retry only that provider error in
+            # JSON-object mode; Pydantic validation still enforces the Ragas
+            # response shape before accepting the score.
+            if getattr(error, "code", None) != "json_validate_failed":
+                raise
+            response = await self.client.chat.completions.create(
+                **request,
+                response_format={"type": "json_object"},
+            )
         content = response.choices[0].message.content
         if not content:
             raise ValueError("Groq returned an empty Ragas evaluation response.")

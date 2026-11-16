@@ -7,7 +7,7 @@ fastapi                     # High-performance web framework for the API
 uvicorn[standard]           # ASGI server to run the FastAPI app
 python-dotenv               # For loading configuration from .env files
 requests                    # HTTP library for internal/external API calls
-streamlit                   # Frontend dashboard for the chat interface
+streamlit>=1.42.0            # OIDC sign-in and frontend dashboard
 numpy                       # Numerical processing
 pandas                      # Evaluation result tables
 pytz                        # Timezone handling for logs
@@ -24,6 +24,10 @@ flashrank                   # Ultra-fast local cross-encoder for semantic rerank
 # --- LANGCHAIN & AGENTIC ORCHESTRATION ---
 langchain                   # Core LLM orchestration
 langgraph                   # State-machine logic for cyclic agent flows
+langgraph-checkpoint-postgres # Durable LangGraph state for multi-user deployments
+psycopg[binary,pool]        # PostgreSQL driver and connection pool
+redis                       # Distributed per-identity rate limiting
+PyJWT[crypto]               # Cognito JWT signature and claims validation
 langchain-groq              # Integration for lightning-fast Llama 3.3 models
 groq                        # Direct Groq SDK used by LangChain's ChatGroq client
 langchain-google-vertexai   # Required shim for NeMo Guardrails internal import (no GCP credentials needed)
@@ -55,6 +59,7 @@ portkey-ai                  # Portkey Gateway for unified LLM routing, fallbacks
 ragas                       # RAG-specific evaluation metrics (Faithfulness, Relevancy, Recall)
 deepeval                    # Pytest-compatible test runner wrapping RAGAS & safety metrics
 langfuse                    # Live production monitoring, tracing & user feedback collection
+boto3                       # Optional S3 backup upload using IAM/default credentials
 
 # --- EMBEDDINGS (SENTENCE TRANSFORMERS) ---
 sentence-transformers       # Used by FlashRank reranker internally

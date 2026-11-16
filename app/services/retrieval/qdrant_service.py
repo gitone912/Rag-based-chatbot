@@ -34,10 +34,19 @@ def search_enterprise_knowledge(query: str, limit: int = 8):
             results.append({
                 "content": res.payload.get("text", ""),
                 "source": res.payload.get("source", "Unknown"),
+                "source_id": res.payload.get("source_id", ""),
+                "source_version": res.payload.get("source_version", ""),
+                "content_sha256": res.payload.get("content_sha256", ""),
+                "ingested_at": res.payload.get("ingested_at", ""),
+                "chunk_index": res.payload.get("chunk_index"),
+                "ingestion_schema_version": res.payload.get("ingestion_schema_version"),
                 "score": res.score
             })
         
         return results
     except Exception as e:
-        logfire.error(f"❌ Qdrant Search Failed: {e}")
-        return []
+        logfire.error(
+            "Qdrant search failed",
+            error_type=type(e).__name__,
+        )
+        raise RuntimeError("Qdrant vector retrieval failed.") from e
