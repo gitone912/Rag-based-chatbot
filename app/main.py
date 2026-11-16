@@ -9,6 +9,8 @@ import math
 import re
 import uuid
 import time
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -134,8 +136,52 @@ def _retry_after_seconds(error: Exception) -> int | None:
     return None
 
 
+def _validate_production_configuration() -> None:
+    """Fail closed when production mode is selected with dev-only settings."""
+    if settings.APP_ENV not in {"development", "test", "production"}:
+        raise RuntimeError("APP_ENV must be development, test, or production.")
+    if settings.APP_ENV != "production":
+        return
+
+    if settings.AUTH_MODE != "cognito":
+        raise RuntimeError("APP_ENV=production requires AUTH_MODE=cognito.")
+    if not settings.COGNITO_ISSUER.startswith("https://") or not settings.COGNITO_CLIENT_ID:
+        raise RuntimeError("Production requires an HTTPS Cognito issuer and client ID.")
+    if not settings.COGNITO_REQUIRED_GROUP:
+        raise RuntimeError("Production requires COGNITO_REQUIRED_GROUP for application authorization.")
+    if not settings.METRICS_BEARER_TOKEN or len(settings.METRICS_BEARER_TOKEN) < 32:
+        raise RuntimeError("Production requires a metrics bearer token of at least 32 characters.")
+    if not settings.QDRANT_URL or not settings.QDRANT_API_KEY:
+        raise RuntimeError("Production requires a hosted Qdrant URL and API key.")
+    qdrant_url = urlparse(settings.QDRANT_URL)
+    if qdrant_url.scheme != "https":
+        raise RuntimeError("Production Qdrant connections must use HTTPS.")
+    if not settings.CHECKPOINT_DATABASE_URL:
+        raise RuntimeError("Production requires CHECKPOINT_DATABASE_URL.")
+    database_url = urlparse(settings.CHECKPOINT_DATABASE_URL)
+    database_options = parse_qs(database_url.query)
+    database_tls = database_options.get("sslmode", [""])[0]
+    database_ca = database_options.get("sslrootcert", [""])[0]
+    if database_tls != "verify-full" or not database_ca or not Path(database_ca).is_file():
+        raise RuntimeError(
+            "Production Postgres connections must set sslmode=verify-full and a valid sslrootcert path."
+        )
+    redis_url = urlparse(settings.RATE_LIMIT_REDIS_URL or "")
+    if redis_url.scheme != "rediss":
+        raise RuntimeError("Production Redis connections must use rediss:// TLS.")
+    if settings.LLM_PROVIDER == "groq" and not settings.GROQ_API_KEY:
+        raise RuntimeError("Production Groq provider requires GROQ_API_KEY.")
+    if settings.LLM_PROVIDER == "gemini" and not settings.GEMINI_API_KEY:
+        raise RuntimeError("Production Gemini provider requires GEMINI_API_KEY.")
+    if settings.LLM_PROVIDER == "portkey" and (
+        not settings.PORTKEY_API_KEY or not settings.PORTKEY_CONFIG_ID
+    ):
+        raise RuntimeError("Production Portkey provider requires API key and saved config ID.")
+
+
 @app.on_event("startup")
 def startup_event():
+    _validate_production_configuration()
     if settings.AUTH_MODE not in {"none", "shared_token", "cognito"}:
         raise RuntimeError("AUTH_MODE must be none, shared_token, or cognito.")
     if settings.AUTH_MODE == "shared_token" and not settings.API_AUTH_TOKEN:
@@ -329,7 +375,7 @@ def query(request: QueryRequest, authorization: Optional[str] = Header(default=N
         )
         raise HTTPException(
             status_code=503,
-            detail={"code": category, "type": deepest_type, "message": public_message, "reference": reference},
+            detail={"code": category, "message": public_message, "reference": reference},
             headers=headers,
         ) from e
 

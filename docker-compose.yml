@@ -75,8 +75,10 @@ services:
   ui:
     build: .
     restart: unless-stopped
-    env_file: .env
     environment:
+      APP_ENV: ${APP_ENV:-development}
+      AUTH_MODE: ${AUTH_MODE:-none}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
       BACKEND_URL: http://api:8000
     command: ["streamlit", "run", "ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
     ports:

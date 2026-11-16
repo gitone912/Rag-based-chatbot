@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 .venv
 __pycache__/
 *.py[cod]
@@ -7,4 +10,14 @@ __pycache__/
 processed_data/
 DATA/
 backups/
+output/
 *.log
+*.err
+Enterprise_RAG_Project_Detailed_Report.docx
+evals/retrieval_holdout.json
+evals/*_results*.json
+evals/*taxonomy*.json
+evals/hybrid_retrieval_comparison.json
+evals/guardrail_validation.json
+evals/guardrail_policy_validation.json
+evals/retrieval_benchmark_results*.json

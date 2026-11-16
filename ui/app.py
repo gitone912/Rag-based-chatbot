@@ -112,7 +112,9 @@ for message in st.session_state.messages:
 
 if prompt := st.chat_input("Ask about your documentation..."):
     # START TRACE: User Interaction
-    with logfire.span("💬 User Chat Interaction", user_query=prompt, session_id=st.session_state.session_id):
+    # Keep raw user prompts out of exported telemetry. They may contain private
+    # document content; request IDs and route-level metrics provide diagnostics.
+    with logfire.span("💬 User Chat Interaction", session_id=st.session_state.session_id):
 
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user", avatar=USER_AVATAR):

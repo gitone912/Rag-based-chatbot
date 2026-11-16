@@ -10,27 +10,16 @@ from langchain_groq import ChatGroq
 from app.config import settings
 
 
-GATEWAY_CONFIG = {
-    "strategy": {"mode": "fallback"},
-    "cache": {"mode": "simple"},
-    "retry": {"attempts": 2, "on_status_codes": [429, 503]},
-    "targets": [
-        {"override_params": {"model": f"@{settings.GROQ_SLUG}/{settings.GROQ_MODEL}"}},
-        {"override_params": {"model": f"@{settings.GROQ_SLUG_2}/{settings.GROQ_MODEL}"}},
-    ],
-}
-
-
 @lru_cache(maxsize=1)
 def get_portkey_client():
     """Create the legacy Portkey client lazily, only when explicitly needed."""
     from portkey_ai import Portkey
 
-    if not settings.PORTKEY_API_KEY:
-        raise RuntimeError("LLM_PROVIDER=portkey requires PORTKEY_API_KEY.")
+    if not settings.PORTKEY_API_KEY or not settings.PORTKEY_CONFIG_ID:
+        raise RuntimeError("LLM_PROVIDER=portkey requires PORTKEY_API_KEY and PORTKEY_CONFIG_ID.")
     return Portkey(
         api_key=settings.PORTKEY_API_KEY,
-        config=settings.PORTKEY_CONFIG_ID or GATEWAY_CONFIG,
+        config=settings.PORTKEY_CONFIG_ID,
     )
 
 
@@ -73,8 +62,8 @@ def get_langchain_llm(feature: str = "rag"):
         from langchain_openai import ChatOpenAI
         from portkey_ai import createHeaders, PORTKEY_GATEWAY_URL
 
-        if not settings.PORTKEY_API_KEY:
-            raise RuntimeError("LLM_PROVIDER=portkey requires PORTKEY_API_KEY.")
+        if not settings.PORTKEY_API_KEY or not settings.PORTKEY_CONFIG_ID:
+            raise RuntimeError("LLM_PROVIDER=portkey requires PORTKEY_API_KEY and PORTKEY_CONFIG_ID.")
         return ChatOpenAI(
             api_key=settings.PORTKEY_API_KEY,
             base_url=PORTKEY_GATEWAY_URL,
@@ -84,7 +73,7 @@ def get_langchain_llm(feature: str = "rag"):
             max_retries=settings.LLM_MAX_RETRIES,
             default_headers=createHeaders(
                 api_key=settings.PORTKEY_API_KEY,
-                config=settings.PORTKEY_CONFIG_ID or GATEWAY_CONFIG,
+                config=settings.PORTKEY_CONFIG_ID,
                 metadata={
                     "feature": feature,
                     "_user": "rag-system",

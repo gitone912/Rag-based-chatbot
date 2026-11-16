@@ -78,10 +78,10 @@ class MemoryRetention:
                 )
             return len(thread_ids)
 
-    def cleanup_if_due(self) -> None:
+    def cleanup_if_due(self) -> int:
         now = time.monotonic()
         if now - self._last_cleanup < 300 or not self._cleanup_lock.acquire(blocking=False):
-            return
+            return 0
         try:
             with self.pool.connection() as connection:
                 with connection.transaction():
@@ -94,6 +94,7 @@ class MemoryRetention:
                         "DELETE FROM rag_memory_threads WHERE expires_at <= now()"
                     )
             self._last_cleanup = now
+            return len(thread_ids)
         finally:
             self._cleanup_lock.release()
 

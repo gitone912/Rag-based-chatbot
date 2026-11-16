@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
+    APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+
     # Keep embeddings aligned with the existing 768-dimensional Qdrant collection.
     # Select Gemini only when the collection has been deliberately reindexed to 3072 dimensions.
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "sentence-transformers").lower()
@@ -47,6 +49,7 @@ class Settings:
     API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
     COGNITO_ISSUER = os.getenv("COGNITO_ISSUER", "").rstrip("/")
     COGNITO_CLIENT_ID = os.getenv("COGNITO_CLIENT_ID", "")
+    COGNITO_REQUIRED_GROUP = os.getenv("COGNITO_REQUIRED_GROUP", "rag-users").strip()
     CHECKPOINT_DATABASE_URL = os.getenv("CHECKPOINT_DATABASE_URL")
     MEMORY_RETENTION_DAYS = int(os.getenv("MEMORY_RETENTION_DAYS", "30"))
     RATE_LIMIT_REDIS_URL = os.getenv("RATE_LIMIT_REDIS_URL")

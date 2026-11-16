@@ -28,6 +28,11 @@ def _qdrant_backup(destination: Path) -> dict:
     if not settings.QDRANT_URL:
         raise RuntimeError("QDRANT_CLUSTER_ENDPOINT is required for a Qdrant backup.")
     base = settings.QDRANT_URL.rstrip("/")
+    parsed_endpoint = urlparse(base)
+    if parsed_endpoint.scheme != "https" and parsed_endpoint.hostname not in {
+        "localhost", "127.0.0.1", "qdrant"
+    }:
+        raise RuntimeError("Remote Qdrant backups require an HTTPS endpoint.")
     collection = settings.QDRANT_COLLECTION
     headers = {"api-key": settings.QDRANT_API_KEY} if settings.QDRANT_API_KEY else {}
     response = requests.post(
@@ -93,7 +98,7 @@ def _postgres_backup(destination: Path) -> dict | None:
     }
 
 
-def _upload_s3(destination: Path, s3_uri: str) -> None:
+def _upload_s3(destination: Path, s3_uri: str, kms_key_id: str | None = None) -> None:
     import boto3
 
     bucket, _, prefix = s3_uri[5:].partition("/")
@@ -102,7 +107,10 @@ def _upload_s3(destination: Path, s3_uri: str) -> None:
     for file_path in destination.iterdir():
         if file_path.is_file():
             key = f"{prefix}/{destination.name}/{file_path.name}".lstrip("/")
-            client.upload_file(str(file_path), bucket, key)
+            extra_args = {"ServerSideEncryption": "aws:kms"}
+            if kms_key_id:
+                extra_args["SSEKMSKeyId"] = kms_key_id
+            client.upload_file(str(file_path), bucket, key, ExtraArgs=extra_args)
             print(f"Uploaded s3://{bucket}/{key}", flush=True)
 
 
@@ -118,11 +126,28 @@ def main() -> None:
         "--s3-uri",
         help="Optional s3://bucket/prefix destination; uses the AWS default credential chain.",
     )
+    parser.add_argument(
+        "--s3-kms-key-id",
+        help="Optional customer-managed KMS key ID or ARN; S3 uploads always request SSE-KMS.",
+    )
     args = parser.parse_args()
+
+    if args.s3_uri:
+        parsed_s3 = urlparse(args.s3_uri)
+        if parsed_s3.scheme != "s3" or not parsed_s3.netloc:
+            raise ValueError("--s3-uri must be an s3://bucket/prefix URI.")
+    if args.s3_kms_key_id and not args.s3_uri:
+        raise ValueError("--s3-kms-key-id requires --s3-uri.")
+    if settings.APP_ENV == "production" and not args.s3_uri:
+        raise RuntimeError("Production backups must be uploaded to an encrypted S3 destination.")
+    if settings.APP_ENV == "production" and not args.s3_kms_key_id:
+        raise RuntimeError("Production backups require an explicit customer-managed KMS key ID.")
 
     timestamp = datetime.now(timezone.utc)
     destination = args.output.resolve() / timestamp.strftime("%Y%m%dT%H%M%SZ")
-    destination.mkdir(parents=True, exist_ok=False)
+    destination.mkdir(parents=True, exist_ok=False, mode=0o700)
+    if os.name != "nt":
+        os.chmod(destination, 0o700)
     artifacts = [_qdrant_backup(destination)]
     postgres_artifact = _postgres_backup(destination)
     if postgres_artifact:
@@ -136,9 +161,7 @@ def main() -> None:
     manifest_path = destination / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if args.s3_uri:
-        if not args.s3_uri.startswith("s3://"):
-            raise ValueError("--s3-uri must start with s3://")
-        _upload_s3(destination, args.s3_uri)
+        _upload_s3(destination, args.s3_uri, args.s3_kms_key_id)
     print(f"Backup complete: {destination}", flush=True)
 
 

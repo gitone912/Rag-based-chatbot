@@ -18,6 +18,7 @@ from app.config import settings
 class Identity:
     subject: str
     provider: str
+    groups: tuple[str, ...] = ()
 
 
 @lru_cache(maxsize=8)
@@ -63,7 +64,16 @@ def authenticate_request(authorization: str | None) -> Identity:
         subject = claims.get("sub")
         if not isinstance(subject, str) or not subject.strip():
             raise jwt.InvalidTokenError("Token subject is missing.")
-        return Identity(subject=subject, provider="cognito")
+        raw_groups = claims.get("cognito:groups", [])
+        if not isinstance(raw_groups, list) or any(not isinstance(group, str) for group in raw_groups):
+            raise jwt.InvalidTokenError("Cognito group claim is invalid.")
+        groups = tuple(raw_groups)
+        required_group = settings.COGNITO_REQUIRED_GROUP
+        if required_group and required_group not in groups:
+            raise HTTPException(status_code=403, detail="Access to this application is not authorized.")
+        return Identity(subject=subject, provider="cognito", groups=groups)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=401,
